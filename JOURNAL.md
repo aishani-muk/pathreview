@@ -11,20 +11,22 @@
 **Problem summary:**
 PathReview ingests a user's documents (README, resume, repo files), splits them
 into chunks, embeds them, and stores the vectors in a ChromaDB collection that the
-RAG retriever later searches. The bug is in how re-ingestion is handled: the
-ingestion pipeline writes embeddings with a raw `vector_db.add(...)` call (an
-append), and although `VectorStore.delete_by_source_id()` exists to clean up a
-document's old vectors, it is never called anywhere in the codebase. Compounding
-this, each chunk's `source_id` is derived from a content hash, so when a document
-is edited and re-ingested it gets a brand-new `source_id` and its previous vectors
-are never overwritten — they linger in the collection as stale results that can be
-returned during retrieval and pollute the generated review. A successful fix wires
-cleanup into the re-ingestion path — deleting a source's prior vectors (or
-upserting with stable IDs) before adding the new ones — so that after re-ingesting
-an edited document the store holds exactly one current set of chunks. This spans
-the RAG retriever (`rag/retriever/vector_store.py`) and the ingestion pipeline
-(`ingestion/pipeline.py`, `ingestion/embeddings/batch_processor.py`), which is why
-it is a whole-pipeline (Tier 3) change rather than a localized fix.
+RAG retriever later searches. The bug is in how the system handles re-ingestion.
+When embeddings are written, the ingestion pipeline makes a raw `vector_db.add(...)`
+call, which appends rather than replaces. There is a `VectorStore.delete_by_source_id()`
+method meant to clean up a document's old vectors, but nothing in the codebase ever
+calls it. This is made worse by how chunk IDs are assigned: each chunk's `source_id`
+comes from a content hash, so editing a document and re-ingesting it produces a
+brand-new `source_id`. The old vectors are never overwritten, and they linger in the
+collection as stale results that retrieval can still return and feed into the
+generated review.
+
+A correct fix wires cleanup into the re-ingestion path, either deleting a source's
+prior vectors before adding the new ones or upserting with stable IDs, so that after
+a document is re-ingested the store holds exactly one current set of chunks. The
+change touches the RAG retriever (`rag/retriever/vector_store.py`) and the ingestion
+pipeline (`ingestion/pipeline.py`, `ingestion/embeddings/batch_processor.py`), which
+is what makes this a whole-pipeline (Tier 3) change rather than a localized fix.
 
 **Selection notes — "Is this right for me?" checklist:**
 - Tier 3 fit: I work as a junior full-stack engineer and have contributed to large
