@@ -56,3 +56,27 @@ is what makes this a whole-pipeline (Tier 3) change rather than a localized fix.
 **Setup confirmation:** [x] App runs locally at localhost:5173
 
 **Cohort ledger:** [x] Issue added to cohort ledger
+
+## Week 8 — Reproduction & solution planning
+
+**Reproduction commit link:** https://github.com/aishani-muk/pathreview/commit/<REPRO_SHA>
+
+**Reproduction summary:**
+Added a deterministic unit test (`tests/unit/test_reingest_stale_embeddings.py`) that
+drives `IngestionPipeline.ingest_readme` twice — once with an original README and once
+with an edited version — against an in-memory fake vector collection, then asserts the
+first version's vectors are gone. Run with `--runxfail` it fails: the store still holds
+the original version's `source_id` (`readme_profile-1_repoX_50e5629b…`) alongside the
+new one, so two content versions coexist instead of one. This confirms stale embeddings
+from the prior version survive re-ingestion. The test is committed as `xfail(strict=True)`
+so the suite stays green until the Week 9 fix removes the marker.
+
+**PLAN.md link:** https://github.com/aishani-muk/pathreview/blob/fix/27-stale-embeddings-reingest/PLAN.md
+
+**Walkthrough video (recommended):** (optional — not recorded)
+
+**Blockers or open questions:**
+Need to confirm in `core/services/review_service.py` whether the pipeline is handed a
+raw ChromaDB collection or the `VectorStore` wrapper, since that determines where the
+delete-before-store call lives. Also deciding how to handle legacy vectors written
+before the fix (no `base_source_id` field to filter on).
