@@ -59,7 +59,7 @@ is what makes this a whole-pipeline (Tier 3) change rather than a localized fix.
 
 ## Week 8 — Reproduction & solution planning
 
-**Reproduction commit link:** https://github.com/aishani-muk/pathreview/commit/<REPRO_SHA>
+**Reproduction commit link:** https://github.com/aishani-muk/pathreview/commit/87be3beba1608072dbccfd66c0d8986233f85bea
 
 **Reproduction summary:**
 Added a deterministic unit test (`tests/unit/test_reingest_stale_embeddings.py`) that
