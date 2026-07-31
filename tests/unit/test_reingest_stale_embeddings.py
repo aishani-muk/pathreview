@@ -5,8 +5,9 @@ https://github.com/jamjamgobambam/pathreview/issues/27
 The ingestion pipeline appends embeddings via a raw ``vector_db.add(...)`` and never
 deletes a source's prior vectors. Because ``source_id`` embeds a content hash, editing
 a document produces a new source_id and its old vectors linger in the collection.
-This test drives the real re-ingestion path and asserts the old version is purged.
-It currently FAILS (xfail); Week 9's fix will make it pass (remove the xfail marker).
+These tests drive the real re-ingestion path and assert the old version is purged.
+The fix (``IngestionPipeline._purge_existing_vectors`` keyed on a stable
+``base_source_id``) makes them pass; they now serve as regression tests.
 """
 
 from typing import Any
@@ -80,13 +81,10 @@ def pipeline() -> tuple[IngestionPipeline, FakeCollection]:
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=True,
-    reason="Issue #27: stale embeddings survive re-ingestion; fixed in Week 9",
-)
 def test_reingesting_edited_readme_purges_old_vectors(
     pipeline: tuple[IngestionPipeline, FakeCollection],
 ) -> None:
+    """Editing and re-ingesting a document leaves only the current version's vectors."""
     p, vector_db = pipeline
 
     r1 = p.ingest_readme("profile-1", "repoX", "# Project\n\nInitial version of the docs.\n")
@@ -96,8 +94,66 @@ def test_reingesting_edited_readme_purges_old_vectors(
     assert r1.source_id != r2.source_id
 
     stored = vector_db.all_source_ids()
-    # THE BUG: the previous version's vectors are never removed on re-ingestion.
     assert r1.source_id not in stored, (
         f"Stale vectors from the previous README version {r1.source_id} "
         f"survived re-ingestion; store holds source_ids {stored}"
     )
+    assert stored == {r2.source_id}
+
+
+@pytest.mark.unit
+def test_identical_reingest_keeps_single_version(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """Re-ingesting identical content re-writes the same ids without duplicating or erroring."""
+    p, vector_db = pipeline
+    content = "# Project\n\nUnchanged content ingested twice.\n"
+
+    p.ingest_readme("profile-1", "repoX", content)
+    ids_after_first = set(vector_db.store)
+    p.ingest_readme("profile-1", "repoX", content)
+
+    assert set(vector_db.store) == ids_after_first
+
+
+@pytest.mark.unit
+def test_first_time_ingest_purge_is_noop(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """The purge step is a safe no-op when the source has never been ingested before."""
+    p, vector_db = pipeline
+
+    result = p.ingest_readme("profile-1", "repoX", "# Project\n\nFirst ever ingest.\n")
+
+    assert vector_db.all_source_ids() == {result.source_id}
+
+
+@pytest.mark.unit
+def test_reingest_scoped_to_repo_leaves_other_repo(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """Re-ingesting one repo's README must not delete another repo's vectors."""
+    p, vector_db = pipeline
+
+    repo_y = p.ingest_readme("profile-1", "repoY", "# Y\n\nRepo Y documentation.\n")
+    p.ingest_readme("profile-1", "repoX", "# X\n\nRepo X documentation.\n")
+    p.ingest_readme("profile-1", "repoX", "# X\n\nRepo X documentation, edited.\n")
+
+    assert repo_y.source_id in vector_db.all_source_ids()
+
+
+@pytest.mark.unit
+def test_reingest_removes_all_old_chunks_multichunk(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """A multi-section document purges every old chunk, not just the first."""
+    p, vector_db = pipeline
+    v1 = "# Title\n\nIntro one.\n\n## Setup\n\nInstall one.\n\n## Usage\n\nRun one.\n"
+    v2 = "# Title\n\nIntro two.\n\n## Setup\n\nInstall two.\n\n## Usage\n\nRun two.\n"
+
+    r1 = p.ingest_readme("profile-1", "repoX", v1)
+    r2 = p.ingest_readme("profile-1", "repoX", v2)
+
+    stored = vector_db.all_source_ids()
+    assert r1.source_id not in stored
+    assert stored == {r2.source_id}
