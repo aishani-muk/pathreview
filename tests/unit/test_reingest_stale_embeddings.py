@@ -1,13 +1,16 @@
-"""Reproduction for issue #27: stale embeddings survive document re-ingestion.
+"""Regression tests for issue #27: stale embeddings survive document re-ingestion.
 
 https://github.com/jamjamgobambam/pathreview/issues/27
 
-The ingestion pipeline appends embeddings via a raw ``vector_db.add(...)`` and never
-deletes a source's prior vectors. Because ``source_id`` embeds a content hash, editing
-a document produces a new source_id and its old vectors linger in the collection.
-These tests drive the real re-ingestion path and assert the old version is purged.
-The fix (``IngestionPipeline._purge_existing_vectors`` keyed on a stable
-``base_source_id``) makes them pass; they now serve as regression tests.
+The ingestion pipeline appended embeddings via a raw ``vector_db.add(...)`` and never
+deleted a source's prior vectors. Because ``source_id`` embeds a content hash, editing a
+document produced a new source_id and its old vectors lingered in the collection.
+
+The fix upserts the new chunks and then deletes any vector sharing the stable
+``base_source_id`` except the version just stored (``IngestionPipeline._purge_stale_vectors``).
+Storing before deleting means a mid-store failure cannot leave the source with neither the
+old nor the new vectors. These tests drive the real re-ingestion path across all three
+ingest methods.
 """
 
 from typing import Any
@@ -19,12 +22,12 @@ from ingestion.pipeline import IngestionPipeline
 
 
 class FakeCollection:
-    """Minimal in-memory stand-in for a ChromaDB collection (add/get/delete)."""
+    """In-memory stand-in for a ChromaDB collection (upsert/add/get/delete + where)."""
 
     def __init__(self) -> None:
         self.store: dict[str, dict[str, Any]] = {}  # id -> {embedding, metadata, document}
 
-    def add(
+    def upsert(
         self,
         ids: list[str],
         embeddings: list | None = None,
@@ -38,16 +41,35 @@ class FakeCollection:
                 "document": documents[i] if documents else "",
             }
 
+    # The pipeline uses upsert; keep add as an alias for completeness.
+    add = upsert
+
+    @staticmethod
+    def _matches(metadata: dict, where: dict) -> bool:
+        """Evaluate a subset of ChromaDB's ``where`` grammar ($and/$or/$eq/$ne)."""
+        if "$and" in where:
+            return all(FakeCollection._matches(metadata, c) for c in where["$and"])
+        if "$or" in where:
+            return any(FakeCollection._matches(metadata, c) for c in where["$or"])
+        for key, cond in where.items():
+            value = metadata.get(key)
+            if isinstance(cond, dict):
+                for op, want in cond.items():
+                    if op == "$eq" and value != want:
+                        return False
+                    if op == "$ne" and value == want:
+                        return False
+            elif value != cond:
+                return False
+        return True
+
     def get(self, where: dict | None = None, ids: list | None = None) -> dict[str, list]:
         matched = []
         for _id, rec in self.store.items():
-            if ids and _id not in ids:
+            if ids is not None and _id not in ids:
                 continue
-            if where:
-                ((k, v),) = where.items()
-                want = v.get("$eq", v) if isinstance(v, dict) else v
-                if rec["metadata"].get(k) != want:
-                    continue
+            if where is not None and not self._matches(rec["metadata"], where):
+                continue
             matched.append(_id)
         return {
             "ids": matched,
@@ -64,8 +86,8 @@ class FakeCollection:
         return {rec["metadata"].get("source_id") for rec in self.store.values()}
 
 
-@pytest.fixture
-def pipeline() -> tuple[IngestionPipeline, FakeCollection]:
+def _make_pipeline() -> tuple[IngestionPipeline, FakeCollection, MagicMock]:
+    """Build a pipeline over an in-memory collection; return it, the store, and the provider."""
     vector_db = FakeCollection()
     db_session = MagicMock()
     # _check_skip queries db_session; make it return None so re-ingestion proceeds.
@@ -77,6 +99,12 @@ def pipeline() -> tuple[IngestionPipeline, FakeCollection]:
         db_session=db_session,
         embedding_provider=provider,
     )
+    return p, vector_db, provider
+
+
+@pytest.fixture
+def pipeline() -> tuple[IngestionPipeline, FakeCollection]:
+    p, vector_db, _ = _make_pipeline()
     return p, vector_db
 
 
@@ -84,7 +112,7 @@ def pipeline() -> tuple[IngestionPipeline, FakeCollection]:
 def test_reingesting_edited_readme_purges_old_vectors(
     pipeline: tuple[IngestionPipeline, FakeCollection],
 ) -> None:
-    """Editing and re-ingesting a document leaves only the current version's vectors."""
+    """Editing and re-ingesting a README leaves only the current version's vectors."""
     p, vector_db = pipeline
 
     r1 = p.ingest_readme("profile-1", "repoX", "# Project\n\nInitial version of the docs.\n")
@@ -102,10 +130,48 @@ def test_reingesting_edited_readme_purges_old_vectors(
 
 
 @pytest.mark.unit
+def test_reingesting_edited_resume_purges_old_vectors(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """The resume ingest path is also idempotent across content edits."""
+    p, vector_db = pipeline
+
+    r1 = p.ingest_resume("profile-1", "Summary\n\nBuilt project A at Company.", "resume.md")
+    r2 = p.ingest_resume(
+        "profile-1", "Summary\n\nBuilt project B at Company, revised.", "resume.md"
+    )
+
+    assert r1.source_id != r2.source_id
+    stored = vector_db.all_source_ids()
+    assert r1.source_id not in stored
+    assert stored == {r2.source_id}
+
+
+@pytest.mark.unit
+def test_reingesting_edited_repo_purges_old_vectors(
+    pipeline: tuple[IngestionPipeline, FakeCollection],
+) -> None:
+    """The repo-metadata ingest path is also idempotent across content edits."""
+    p, vector_db = pipeline
+
+    r1 = p.ingest_repo_metadata(
+        "profile-1", {"name": "repoX", "description": "v1", "language": "Python"}
+    )
+    r2 = p.ingest_repo_metadata(
+        "profile-1", {"name": "repoX", "description": "v2 edited", "language": "Python"}
+    )
+
+    assert r1.source_id != r2.source_id
+    stored = vector_db.all_source_ids()
+    assert r1.source_id not in stored
+    assert stored == {r2.source_id}
+
+
+@pytest.mark.unit
 def test_identical_reingest_keeps_single_version(
     pipeline: tuple[IngestionPipeline, FakeCollection],
 ) -> None:
-    """Re-ingesting identical content re-writes the same ids without duplicating or erroring."""
+    """Re-ingesting identical content upserts the same ids without duplicating or erroring."""
     p, vector_db = pipeline
     content = "# Project\n\nUnchanged content ingested twice.\n"
 
@@ -157,3 +223,23 @@ def test_reingest_removes_all_old_chunks_multichunk(
     stored = vector_db.all_source_ids()
     assert r1.source_id not in stored
     assert stored == {r2.source_id}
+
+
+@pytest.mark.unit
+def test_store_failure_preserves_previous_version() -> None:
+    """If storing the new version fails, the previous version's vectors survive.
+
+    This is the point of storing before deleting: a failed re-ingest must not leave the
+    source with neither the old nor the new vectors.
+    """
+    p, vector_db, provider = _make_pipeline()
+
+    r1 = p.ingest_readme("profile-1", "repoX", "# T\n\nOriginal content.\n")
+
+    # The next ingestion fails while embedding the new version.
+    provider.embed = MagicMock(side_effect=RuntimeError("embedding backend down"))
+    with pytest.raises(RuntimeError):
+        p.ingest_readme("profile-1", "repoX", "# T\n\nEdited content that fails to embed.\n")
+
+    # The old version is still present and intact.
+    assert vector_db.all_source_ids() == {r1.source_id}

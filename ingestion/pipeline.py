@@ -1,6 +1,5 @@
 import hashlib
 from dataclasses import dataclass
-from typing import Optional
 
 import structlog
 
@@ -11,17 +10,17 @@ from .parsers.readme_parser import ReadmeParser
 from .parsers.repo_analyzer import RepoAnalyzer
 from .parsers.resume_parser import ResumeParser
 
-
 logger = structlog.get_logger()
 
 
 @dataclass
 class IngestResult:
     """Result of ingesting a source."""
+
     source_id: str
     chunk_count: int
     skipped: bool
-    skip_reason: Optional[str] = None
+    skip_reason: str | None = None
 
 
 class IngestionPipeline:
@@ -87,25 +86,30 @@ class IngestionPipeline:
         try:
             # Parse resume
             parse_result = self.resume_parser.parse(content)
-            logger.info("Resume parsed successfully", sections=parse_result.metadata.get("detected_sections"))
+            logger.info(
+                "Resume parsed successfully",
+                sections=parse_result.metadata.get("detected_sections"),
+            )
 
             # Prepare metadata
             metadata = parse_result.metadata.copy()
-            metadata.update({
-                "source_id": source_id,
-                "base_source_id": base_source_id,
-                "profile_id": profile_id,
-                "filename": filename,
-                "source_type": "resume",
-            })
+            metadata.update(
+                {
+                    "source_id": source_id,
+                    "base_source_id": base_source_id,
+                    "profile_id": profile_id,
+                    "filename": filename,
+                    "source_type": "resume",
+                }
+            )
 
             # Chunk the content
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("Resume chunked successfully", chunk_count=len(chunks))
 
-            # Remove any prior version's vectors, then store the new chunks
-            self._purge_existing_vectors(base_source_id)
+            # Store the new chunks, then remove any prior version's vectors
             self.batch_processor.process(chunks)
+            self._purge_stale_vectors(base_source_id, source_id)
             logger.info("Resume embeddings stored", chunk_count=len(chunks))
 
             # Record in database
@@ -169,21 +173,23 @@ class IngestionPipeline:
 
             # Prepare metadata
             metadata = parse_result.metadata.copy()
-            metadata.update({
-                "source_id": source_id,
-                "base_source_id": base_source_id,
-                "profile_id": profile_id,
-                "repo_name": repo_name,
-                "source_type": "readme",
-            })
+            metadata.update(
+                {
+                    "source_id": source_id,
+                    "base_source_id": base_source_id,
+                    "profile_id": profile_id,
+                    "repo_name": repo_name,
+                    "source_type": "readme",
+                }
+            )
 
             # Chunk the content
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("README chunked successfully", chunk_count=len(chunks))
 
-            # Remove any prior version's vectors, then store the new chunks
-            self._purge_existing_vectors(base_source_id)
+            # Store the new chunks, then remove any prior version's vectors
             self.batch_processor.process(chunks)
+            self._purge_stale_vectors(base_source_id, source_id)
             logger.info("README embeddings stored", chunk_count=len(chunks))
 
             # Record in database
@@ -246,20 +252,22 @@ class IngestionPipeline:
 
             # Prepare metadata
             metadata = parse_result.metadata.copy()
-            metadata.update({
-                "source_id": source_id,
-                "base_source_id": base_source_id,
-                "profile_id": profile_id,
-                "source_type": "repo",
-            })
+            metadata.update(
+                {
+                    "source_id": source_id,
+                    "base_source_id": base_source_id,
+                    "profile_id": profile_id,
+                    "source_type": "repo",
+                }
+            )
 
             # Chunk the content
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("Repository metadata chunked successfully", chunk_count=len(chunks))
 
-            # Remove any prior version's vectors, then store the new chunks
-            self._purge_existing_vectors(base_source_id)
+            # Store the new chunks, then remove any prior version's vectors
             self.batch_processor.process(chunks)
+            self._purge_stale_vectors(base_source_id, source_id)
             logger.info("Repository embeddings stored", chunk_count=len(chunks))
 
             # Record in database
@@ -280,23 +288,41 @@ class IngestionPipeline:
             )
             raise
 
-    def _purge_existing_vectors(self, base_source_id: str) -> None:
-        """Delete vectors from any prior ingestion of this logical source.
+    def _purge_stale_vectors(self, base_source_id: str, current_source_id: str) -> None:
+        """Delete vectors left over from prior versions of this logical source.
 
         Makes re-ingestion idempotent. Because ``source_id`` embeds a content hash, an
-        edited document would otherwise leave its old vectors orphaned in the collection.
-        Deleting by the stable ``base_source_id`` removes prior versions before the new
-        chunks are stored. Safe no-op when nothing matches.
+        edited document produces new vector ids and would otherwise leave its old vectors
+        orphaned in the collection. This deletes every vector sharing the stable
+        ``base_source_id`` except the version just stored (``current_source_id``).
+
+        It is called *after* the new chunks are stored, so a failure while embedding or
+        storing cannot leave the source with neither the old nor the new vectors — the
+        previous version survives until the new one is safely in place. Safe no-op when
+        nothing matches.
 
         Args:
             base_source_id: Stable identifier for the logical source (no content hash).
+            current_source_id: Content-hashed id of the version just stored; its vectors
+                are preserved, all older ones for this source are removed.
         """
         try:
-            self.vector_db.delete(where={"base_source_id": {"$eq": base_source_id}})
-            logger.info("Purged prior vectors for source", base_source_id=base_source_id)
+            self.vector_db.delete(
+                where={
+                    "$and": [
+                        {"base_source_id": {"$eq": base_source_id}},
+                        {"source_id": {"$ne": current_source_id}},
+                    ]
+                }
+            )
+            logger.info(
+                "Purged stale vectors for source",
+                base_source_id=base_source_id,
+                current_source_id=current_source_id,
+            )
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(
-                "Could not purge prior vectors",
+                "Could not purge stale vectors",
                 base_source_id=base_source_id,
                 error=str(e),
             )
@@ -307,7 +333,7 @@ class IngestionPipeline:
             content = content.encode()
         return hashlib.sha256(content).hexdigest()[:16]
 
-    def _check_skip(self, source_id: str, source_type: str) -> Optional[IngestResult]:
+    def _check_skip(self, source_id: str, source_type: str) -> IngestResult | None:
         """
         Check if source has already been ingested.
 
@@ -316,9 +342,11 @@ class IngestionPipeline:
         try:
             # Query database for existing source
             # This assumes a table/model named IngestedSource
-            existing = self.db_session.query(
-                "IngestedSource"  # Placeholder - actual query depends on ORM
-            ).filter_by(source_id=source_id).first()
+            existing = (
+                self.db_session.query("IngestedSource")  # Placeholder - actual query depends on ORM
+                .filter_by(source_id=source_id)
+                .first()
+            )
 
             if existing:
                 logger.info("Source already ingested, skipping", source_id=source_id)
