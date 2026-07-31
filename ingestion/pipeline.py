@@ -69,7 +69,8 @@ class IngestionPipeline:
         Returns:
             IngestResult with ingestion status
         """
-        source_id = f"resume_{profile_id}_{self._hash_content(content)}"
+        base_source_id = f"resume_{profile_id}"
+        source_id = f"{base_source_id}_{self._hash_content(content)}"
 
         logger.info(
             "Starting resume ingestion",
@@ -92,6 +93,7 @@ class IngestionPipeline:
             metadata = parse_result.metadata.copy()
             metadata.update({
                 "source_id": source_id,
+                "base_source_id": base_source_id,
                 "profile_id": profile_id,
                 "filename": filename,
                 "source_type": "resume",
@@ -101,7 +103,8 @@ class IngestionPipeline:
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("Resume chunked successfully", chunk_count=len(chunks))
 
-            # Generate embeddings and store
+            # Remove any prior version's vectors, then store the new chunks
+            self._purge_existing_vectors(base_source_id)
             self.batch_processor.process(chunks)
             logger.info("Resume embeddings stored", chunk_count=len(chunks))
 
@@ -140,7 +143,8 @@ class IngestionPipeline:
         Returns:
             IngestResult with ingestion status
         """
-        source_id = f"readme_{profile_id}_{repo_name}_{self._hash_content(content)}"
+        base_source_id = f"readme_{profile_id}_{repo_name}"
+        source_id = f"{base_source_id}_{self._hash_content(content)}"
 
         logger.info(
             "Starting README ingestion",
@@ -167,6 +171,7 @@ class IngestionPipeline:
             metadata = parse_result.metadata.copy()
             metadata.update({
                 "source_id": source_id,
+                "base_source_id": base_source_id,
                 "profile_id": profile_id,
                 "repo_name": repo_name,
                 "source_type": "readme",
@@ -176,7 +181,8 @@ class IngestionPipeline:
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("README chunked successfully", chunk_count=len(chunks))
 
-            # Generate embeddings and store
+            # Remove any prior version's vectors, then store the new chunks
+            self._purge_existing_vectors(base_source_id)
             self.batch_processor.process(chunks)
             logger.info("README embeddings stored", chunk_count=len(chunks))
 
@@ -214,7 +220,8 @@ class IngestionPipeline:
             IngestResult with ingestion status
         """
         repo_name = repo_data.get("name", "unknown")
-        source_id = f"repo_{profile_id}_{repo_name}_{self._hash_content(str(repo_data))}"
+        base_source_id = f"repo_{profile_id}_{repo_name}"
+        source_id = f"{base_source_id}_{self._hash_content(str(repo_data))}"
 
         logger.info(
             "Starting repo metadata ingestion",
@@ -241,6 +248,7 @@ class IngestionPipeline:
             metadata = parse_result.metadata.copy()
             metadata.update({
                 "source_id": source_id,
+                "base_source_id": base_source_id,
                 "profile_id": profile_id,
                 "source_type": "repo",
             })
@@ -249,7 +257,8 @@ class IngestionPipeline:
             chunks = self.strategy_selector.chunk(parse_result.text, metadata)
             logger.info("Repository metadata chunked successfully", chunk_count=len(chunks))
 
-            # Generate embeddings and store
+            # Remove any prior version's vectors, then store the new chunks
+            self._purge_existing_vectors(base_source_id)
             self.batch_processor.process(chunks)
             logger.info("Repository embeddings stored", chunk_count=len(chunks))
 
@@ -270,6 +279,27 @@ class IngestionPipeline:
                 error=str(e),
             )
             raise
+
+    def _purge_existing_vectors(self, base_source_id: str) -> None:
+        """Delete vectors from any prior ingestion of this logical source.
+
+        Makes re-ingestion idempotent. Because ``source_id`` embeds a content hash, an
+        edited document would otherwise leave its old vectors orphaned in the collection.
+        Deleting by the stable ``base_source_id`` removes prior versions before the new
+        chunks are stored. Safe no-op when nothing matches.
+
+        Args:
+            base_source_id: Stable identifier for the logical source (no content hash).
+        """
+        try:
+            self.vector_db.delete(where={"base_source_id": {"$eq": base_source_id}})
+            logger.info("Purged prior vectors for source", base_source_id=base_source_id)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not purge prior vectors",
+                base_source_id=base_source_id,
+                error=str(e),
+            )
 
     def _hash_content(self, content: str | bytes) -> str:
         """Generate a hash of content for deduplication."""
