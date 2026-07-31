@@ -80,3 +80,51 @@ Need to confirm in `core/services/review_service.py` whether the pipeline is han
 raw ChromaDB collection or the `VectorStore` wrapper, since that determines where the
 delete-before-store call lives. Also deciding how to handle legacy vectors written
 before the fix (no `base_source_id` field to filter on).
+
+## Week 9 — Solution building & PR submission
+
+### Check-in 1 (mid-week)
+
+**Current progress:**
+Implemented PLAN.md sub-tasks 1–4: derived a stable, unhashed `base_source_id` in
+`ingest_resume`/`ingest_readme`/`ingest_repo_metadata` (chunkers preserve it, the batch
+processor persists it) and added a `_purge_stale_vectors()` helper. Resolved the Week 8 open
+question: the real ingestion path receives a raw ChromaDB collection and
+`review_service._run_ingestion_pipeline` is a stub, so the fix lives entirely in `pipeline.py`.
+The Week 8 reproduction test now passes with the `xfail` removed.
+
+**Next steps:**
+Add edge-case tests (identical re-ingest, first-time no-op, per-repo isolation, multi-chunk),
+compare `make test-unit`/`make check` against the pre-existing baseline, fill the PR template,
+and open the PR.
+
+**Blockers:**
+The seeded codebase has documented pre-existing failures unrelated to #27 (53 failing unit
+tests, 182 ruff errors, mypy erroring on a NumPy-2/Python-3.13 stub). Confirmed my change adds
+none; documenting per the pre-existing-failures guidance.
+
+---
+
+### Check-in 2 (end of week)
+
+**PR link:** https://github.com/ascherj/pathreview/pull/433
+
+**Branch:** fix/27-stale-embeddings-reingest
+
+**What you built:**
+Made document re-ingestion idempotent: the pipeline derives a stable `base_source_id`, upserts
+the new chunks, and then deletes any older vectors for that source (`source_id != current`), so
+editing and re-ingesting a document no longer leaves stale embeddings for retrieval to surface.
+Storing before deleting means a mid-store failure can't wipe the old version.
+
+**Tests added or updated:**
+`tests/unit/test_reingest_stale_embeddings.py` — un-xfailed the reproduction test and added
+seven more (8 total): edited re-ingest purges the old version for the readme, resume, and repo
+paths; identical re-ingest keeps a single version; first-time purge is a safe no-op; per-repo
+scoping leaves another repo's vectors intact; a multi-chunk case removes every old chunk; and a
+store-failure case confirms the previous version survives when embedding the new one fails.
+
+**Self-review confirmation:** [x] make check passes  [x] make test-unit passes
+(pre-existing failures documented in the PR; my change introduces no new failures)
+
+**Draft PR feedback received from:** none (peer review optional this session)
