@@ -128,3 +128,64 @@ store-failure case confirms the previous version survives when embedding the new
 (pre-existing failures documented in the PR; my change introduces no new failures)
 
 **Draft PR feedback received from:** none (peer review optional this session)
+
+## Week 10 - Iteration & reflection
+
+### Reviewer feedback
+
+**Feedback received:** [ ] Yes  [x] No, still awaiting review
+
+**Summary of feedback:**
+No reviewer feedback came in. Peer and maintainer review is not part of the Summer 2026 session. I
+opened the PR as ready for review and it stays open pending any response.
+
+**How you responded:**
+N/A. There was no feedback to respond to.
+
+---
+
+### Reflection
+
+**What was harder than you expected?**
+The fix was about forty lines, but trusting the codebase was the hard part. The seeded repo did not
+match its own issue tracker. Two issues I first considered (#76 and #77) were already fixed in the
+code, and the vector store had a `delete_by_source_id()` method that looked like the answer until I
+grepped and found nothing ever called it. The environment also fought me: the `docker` CLI was
+missing from my PATH, the ChromaDB container crashed on a NumPy 2 error, and `make test-unit`
+already had 53 failing tests before I changed anything. Telling my bug apart from the repo's
+pre-existing noise took more discipline than the fix did.
+
+**What did you learn about working in a large codebase?**
+In my own projects I hold the whole thing in my head. Here I had to trace one call path, from
+`ingest_readme` into `batch_processor.process` into `_store_embedding` into the raw `vector_db`
+write, across four files before I understood where the bug lived. The clearest lesson was that a
+function's name can mislead: `review_service._run_ingestion_pipeline` looked like the ingestion
+entry point but was a stub, and the real path was only exercised by tests. Fitting in mattered too.
+I used Conventional Commits, matched the mock-based test style already in `test_batch_processor.py`,
+and deliberately did not reformat 52 files of pre-existing style drift just because the linter
+wanted to.
+
+**How did AI tools help, and where did they fall short?**
+AI was most useful for reconnaissance and bookkeeping at scale. It mapped the ingestion and RAG
+modules, confirmed which chunkers preserved metadata so a new `base_source_id` key would propagate,
+baselined the 53 failing tests and 182 ruff errors so I could prove my change added none, and
+scaffolded the in-memory `FakeCollection` test double. It also fell short. It first framed the issue
+in the tracker's words until I ran the code and saw the real state, it could not run a real
+integration test because the ChromaDB container was broken, and when it suggested a
+delete-before-store ordering I had to reject it because that version could wipe a user's data on a
+failed write. The judgment calls were mine.
+
+**What would you do differently if you started over?**
+I would confirm the issue actually reproduces in the real code before writing my Week 7 problem
+summary, because I nearly committed to issues that were already fixed. I would also get ChromaDB
+running early in Week 8 by swapping the pinned image past the NumPy 2 break, so I could ship a real
+integration test instead of only a fake-backed unit test. And I would distrust my first green
+solution sooner, since my initial fix passed every test but still had a data-loss flaw.
+
+**What are you most proud of from this module?**
+Catching the atomicity flaw in my own solution. My delete-before-store version worked and the suite
+was green, but I realized a failed embedding write would delete a user's existing vectors and store
+nothing in their place, which is worse than the original bug. I reordered it to upsert the new
+chunks first and then delete only the stale ones, and added
+`test_store_failure_preserves_previous_version` to lock that behavior in. The habit I am keeping is
+that passing tests and being robust are not the same thing.
